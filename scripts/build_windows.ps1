@@ -1,84 +1,16 @@
-$ErrorActionPreference = "Stop"
+from pathlib import Path
+import shutil, zipfile, re
 
-$ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$BuildRoot = Join-Path $ProjectRoot ".build"
-$Venv = Join-Path $BuildRoot "venv"
-$StageHome = Join-Path $BuildRoot "runtime_home"
-$Dist = Join-Path $ProjectRoot "dist"
+src = Path("/mnt/data/score-player-desktop-v0.8")
+dst = Path("/mnt/data/score-player-desktop-v0.8.1")
+if dst.exists():
+    shutil.rmtree(dst)
+shutil.copytree(src, dst)
 
-Write-Host "== ScorePlayer v0.8 Windows portable build ==" -ForegroundColor Cyan
+script = dst / "scripts" / "build_windows.ps1"
+s = script.read_text(encoding="utf-8")
 
-Remove-Item $BuildRoot -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item $Dist -Recurse -Force -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force -Path $BuildRoot, $StageHome | Out-Null
-
-# Use the Python already present on the Windows build machine.
-py -3.12 -m venv $Venv
-$Python = Join-Path $Venv "Scripts\python.exe"
-$Pip = Join-Path $Venv "Scripts\pip.exe"
-
-& $Python -m pip install --upgrade pip wheel setuptools
-& $Pip install "homr[cpu]" PySide6 pyinstaller numpy opencv-python-headless Pillow pytest
-
-# Force model downloads/caches into a folder that will later be packed into the app.
-$env:HOME = $StageHome
-$env:USERPROFILE = $StageHome
-$env:XDG_CACHE_HOME = Join-Path $StageHome ".cache"
-$env:HF_HOME = Join-Path $StageHome ".cache\huggingface"
-$env:TORCH_HOME = Join-Path $StageHome ".cache\torch"
-
-# Generate a simple staff fixture so the build can warm the actual HOMR model.
-& $Python (Join-Path $PSScriptRoot "make_warmup_score.py")
-
-$WarmupImage = Join-Path $ProjectRoot "fixtures\warmup_score.png"
-Push-Location $BuildRoot
-try {
-    Write-Host "Warming HOMR models (network is allowed only at build time)..." -ForegroundColor Yellow
-    & $Venv\Scripts\homr.exe $WarmupImage
-}
-finally {
-    Pop-Location
-}
-
-# Verify the runtime can now start with network explicitly disabled.
-$env:HF_HUB_OFFLINE = "1"
-$env:TRANSFORMERS_OFFLINE = "1"
-& $Python (Join-Path $PSScriptRoot "self_test.py") --require-engine
-
-# Build one-folder portable app. The user only starts ScorePlayer.exe.
-Push-Location $ProjectRoot
-try {
-    & $Python -m PyInstaller `
-        --noconfirm `
-        --clean `
-        --windowed `
-        --name ScorePlayer `
-        --collect-all homr `
-        --collect-all onnxruntime `
-        --collect-all rapidocr `
-        --collect-all PySide6 `
-        --add-data "$StageHome;runtime_home" `
-        --hidden-import homr.main `
-        --paths $ProjectRoot `
-        scoreplayer\main.py
-}
-finally {
-    Pop-Location
-}
-
-$Exe = Join-Path $Dist "ScorePlayer\ScorePlayer.exe"
-if (!(Test-Path $Exe)) {
-    throw "ScorePlayer.exe was not produced."
-}
-
-# Critical release gate: execute the ACTUAL packaged EXE with network disabled.
-# This proves that the packaged program can import HOMR/ONNX and run one real
-# offline OMR inference using the bundled model cache.
-$env:HF_HUB_OFFLINE = "1"
-$env:TRANSFORMERS_OFFLINE = "1"
-$PackagedReport = Join-Path $Dist "packaged-self-test.json"
-
-Write-Host "Running packaged EXE offline self-test..." -ForegroundColor Yellow
+old = r'''Write-Host "Running packaged EXE offline self-test..." -ForegroundColor Yellow
 & $Exe `
     --self-test `
     --require-engine `
@@ -95,17 +27,96 @@ if (-not $PackagedJson.passed -or -not $PackagedJson.checks.omr_offline_inferenc
     Get-Content $PackagedReport
     throw "Packaged ScorePlayer.exe did not pass offline OMR inference."
 }
+'''
 
-# Copy source/license notice into the portable folder for AGPL compliance.
-Copy-Item (Join-Path $ProjectRoot "README.md") (Join-Path $Dist "ScorePlayer\README.md")
-Copy-Item (Join-Path $ProjectRoot "THIRD_PARTY_NOTICES.md") (Join-Path $Dist "ScorePlayer\THIRD_PARTY_NOTICES.md")
-Copy-Item (Join-Path $ProjectRoot "SOURCE_OFFER.txt") (Join-Path $Dist "ScorePlayer\SOURCE_OFFER.txt")
+new = r'''Write-Host "Running packaged EXE offline self-test..." -ForegroundColor Yellow
 
-# ZIP final portable package.
-$Zip = Join-Path $Dist "ScorePlayer-Windows-x64-portable-v0.8.zip"
-if (Test-Path $Zip) { Remove-Item $Zip -Force }
-Compress-Archive -Path (Join-Path $Dist "ScorePlayer\*") -DestinationPath $Zip -CompressionLevel Optimal
+# ScorePlayer.exe is built with PyInstaller --windowed, so invoking it with "&"
+# can return control to PowerShell before the GUI-subsystem process has actually
+# finished. Use Start-Process -Wait so the build does not try to read the report
+# before ScorePlayer.exe has written it.
+if (Test-Path $PackagedReport) {
+    Remove-Item $PackagedReport -Force
+}
 
-Write-Host ""
-Write-Host "Built: $Zip" -ForegroundColor Green
-Write-Host "End users only need to unzip and double-click ScorePlayer.exe." -ForegroundColor Green
+$SelfTestArgs = @(
+    "--self-test",
+    "--require-engine",
+    "--omr-smoke", "`"$WarmupImage`"",
+    "--self-test-report", "`"$PackagedReport`""
+)
+
+$SelfTestProcess = Start-Process `
+    -FilePath $Exe `
+    -ArgumentList $SelfTestArgs `
+    -WorkingDirectory (Split-Path $Exe -Parent) `
+    -Wait `
+    -PassThru
+
+Write-Host "Packaged EXE self-test exit code: $($SelfTestProcess.ExitCode)"
+
+if ($SelfTestProcess.ExitCode -ne 0) {
+    if (Test-Path $PackagedReport) {
+        Write-Host "Self-test report:"
+        Get-Content $PackagedReport
+    }
+    throw "Packaged ScorePlayer.exe failed offline OMR self-test with exit code $($SelfTestProcess.ExitCode)."
+}
+
+if (!(Test-Path $PackagedReport)) {
+    throw "Packaged ScorePlayer.exe exited successfully but did not create packaged-self-test.json. This usually means the self-test arguments were not processed correctly."
+}
+
+$PackagedJson = Get-Content $PackagedReport -Raw | ConvertFrom-Json
+if (-not $PackagedJson.passed -or -not $PackagedJson.checks.omr_offline_inference) {
+    Write-Host "Self-test report:"
+    Get-Content $PackagedReport
+    throw "Packaged ScorePlayer.exe did not pass offline OMR inference."
+}
+'''
+
+if old not in s:
+    raise RuntimeError("Expected self-test block not found")
+s = s.replace(old, new)
+
+# Make version label clearer in build output without changing artifact name.
+s = s.replace('== ScorePlayer v0.8 Windows portable build ==',
+              '== ScorePlayer v0.8.1 Windows portable build ==')
+
+script.write_text(s, encoding="utf-8")
+
+fix_note = dst / "FIX_0.8.1.md"
+fix_note.write_text(
+"""# v0.8.1 build fix
+
+GitHub Actions 已经成功完成 PyInstaller 打包。
+
+失败点发生在“打包后的 EXE 离线自检”阶段：`ScorePlayer.exe` 是 `--windowed` GUI 程序，
+PowerShell 用 `& $Exe ...` 启动后可能在 EXE 真正结束前就继续执行，因此立即读取
+`packaged-self-test.json`，导致“文件不存在”。
+
+v0.8.1 修改为：
+
+- `Start-Process -Wait -PassThru`
+- 明确等待真正的 `ScorePlayer.exe` 自检结束
+- 检查 EXE 的真实 ExitCode
+- 报告不存在时给出明确错误，而不是直接 `Get-Content` 崩溃
+- 自检失败时打印已有报告
+
+不需要修改 GitHub Actions workflow；只需替换 `scripts/build_windows.ps1` 后重新运行 workflow。
+""", encoding="utf-8")
+
+# Also create a standalone replacement script for easiest GitHub upload/edit.
+standalone = Path("/mnt/data/build_windows-fixed-v0.8.1.ps1")
+shutil.copy2(script, standalone)
+
+zip_path = Path("/mnt/data/ScorePlayer-Desktop-v0.8.1-build-fix.zip")
+if zip_path.exists():
+    zip_path.unlink()
+with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+    for p in dst.rglob("*"):
+        if p.is_file() and "__pycache__" not in p.parts and p.suffix != ".pyc":
+            z.write(p, arcname=f"ScorePlayer-Desktop-v0.8.1/{p.relative_to(dst)}")
+
+print("Created:", standalone)
+print("Created:", zip_path)
