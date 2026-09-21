@@ -1,0 +1,10 @@
+ScorePlayer v0.8 source offer
+
+This portable build is intended to be distributed together with the corresponding
+ScorePlayer source archive and the exact HOMR source/version used by the build.
+
+When publishing a release:
+1. Attach ScorePlayer-Desktop-v0.8-source.zip.
+2. Record the installed HOMR version (`python -m pip show homr`).
+3. Provide the corresponding HOMR source as required by AGPL-3.0.
+4. Preserve third-party license notices.
