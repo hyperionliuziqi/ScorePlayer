@@ -1,0 +1,27 @@
+name: build-windows-portable
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build portable app
+        shell: powershell
+        run: .\scripts\build_windows.ps1
+
+      - name: Upload portable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: ScorePlayer-Windows-x64-portable-v0.8
+          path: dist/ScorePlayer-Windows-x64-portable-v0.8.zip
+          if-no-files-found: error
