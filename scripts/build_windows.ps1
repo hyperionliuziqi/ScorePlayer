@@ -6,7 +6,7 @@ $Venv = Join-Path $BuildRoot "venv"
 $StageHome = Join-Path $BuildRoot "runtime_home"
 $Dist = Join-Path $ProjectRoot "dist"
 
-Write-Host "== ScorePlayer v0.8.2 Windows portable build ==" -ForegroundColor Cyan
+Write-Host "== ScorePlayer v0.8.3 Windows portable build ==" -ForegroundColor Cyan
 
 Remove-Item $BuildRoot -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item $Dist -Recurse -Force -ErrorAction SilentlyContinue
@@ -19,15 +19,14 @@ $Homr = Join-Path $Venv "Scripts\homr.exe"
 
 & $Python -m pip install --upgrade pip wheel setuptools
 
-# Pin the HOMR release used by this build so future package updates do not
-# unexpectedly change the portable build behavior.
-& $Pip install "homr[cpu]==0.7.0" PySide6 pyinstaller numpy opencv-python-headless Pillow pytest
+# Keep a known HOMR version for reproducible CI builds.
+& $Pip install "homr[cpu]==0.7.0" PySide6 pyinstaller "numpy<2.3" opencv-python-headless Pillow pytest
 
 Write-Host ""
-Write-Host "Installed runtime versions:" -ForegroundColor Cyan
+Write-Host "Installed versions:" -ForegroundColor Cyan
 & $Pip show homr numpy opencv-python-headless onnxruntime
 
-# Force every model/cache download into a directory that will later be bundled.
+# Keep all downloaded model/cache files inside the portable staging area.
 $env:HOME = $StageHome
 $env:USERPROFILE = $StageHome
 $env:XDG_CACHE_HOME = Join-Path $StageHome ".cache"
@@ -35,57 +34,84 @@ $env:HF_HOME = Join-Path $StageHome ".cache\huggingface"
 $env:TORCH_HOME = Join-Path $StageHome ".cache\torch"
 
 # ---------------------------------------------------------------------------
-# Real OMR smoke image
+# Download a REAL, PUBLIC-DOMAIN piano score for OMR smoke testing.
 # ---------------------------------------------------------------------------
-# The old build used an artificial one-staff drawing. HOMR is trained for real
-# printed sheet music and that synthetic image could reach an internal
-# singleton edge case ("numpy.int32 object is not iterable").
+# Previous builds used either a hand-drawn synthetic page or an unsuitable
+# remote sample. HOMR's staff detector then returned "Found 0 staffs".
 #
-# Use HOMR's own public example score instead. This is only used during CI to
-# pre-warm models and validate inference; it is not shipped as user content.
-$WarmupImage = Join-Path $BuildRoot "homr-official-smoke.jpg"
-$OfficialSmokeUrl = "https://raw.githubusercontent.com/liebharc/homr/main/figures/tabi.jpg"
+# This build uses public-domain printed piano notation from Wikimedia Commons.
+# We try two independent files so one URL/CDN problem does not kill the build.
+$WarmupImage = Join-Path $BuildRoot "omr-real-score.png"
 
-Write-Host ""
-Write-Host "Downloading HOMR official smoke-test score..." -ForegroundColor Yellow
+$SmokeUrls = @(
+    "https://commons.wikimedia.org/wiki/Special:Redirect/file/RondoAllaTurcaMozart.png",
+    "https://commons.wikimedia.org/wiki/Special:Redirect/file/Beethoven%20canon%20from%20op%20101.png"
+)
 
-try {
-    Invoke-WebRequest `
-        -Uri $OfficialSmokeUrl `
-        -OutFile $WarmupImage `
-        -UseBasicParsing
+$Downloaded = $false
+
+foreach ($Url in $SmokeUrls) {
+    try {
+        Write-Host ""
+        Write-Host "Downloading real public-domain OMR smoke image:" -ForegroundColor Yellow
+        Write-Host $Url
+
+        Invoke-WebRequest `
+            -Uri $Url `
+            -OutFile $WarmupImage `
+            -MaximumRedirection 10 `
+            -UseBasicParsing
+
+        if ((Test-Path $WarmupImage) -and ((Get-Item $WarmupImage).Length -gt 10000)) {
+            $Downloaded = $true
+            break
+        }
+    }
+    catch {
+        Write-Warning "Smoke image download failed: $($_.Exception.Message)"
+    }
 }
-catch {
-    Write-Warning "Could not download HOMR official smoke image: $($_.Exception.Message)"
-    Write-Host "Falling back to locally generated warmup score..." -ForegroundColor Yellow
 
-    & $Python (Join-Path $PSScriptRoot "make_warmup_score.py")
-    $WarmupImage = Join-Path $ProjectRoot "fixtures\warmup_score.png"
-}
-
-if (!(Test-Path $WarmupImage)) {
-    throw "OMR smoke-test image does not exist: $WarmupImage"
+if (-not $Downloaded) {
+    throw "Could not download a valid real sheet-music smoke image."
 }
 
 Write-Host "Smoke image: $WarmupImage"
 Write-Host "Smoke image size: $((Get-Item $WarmupImage).Length) bytes"
 
+# Verify OpenCV can actually decode the downloaded file before giving it to HOMR.
+$ValidateImageCode = @'
+import cv2, sys
+p = sys.argv[1]
+img = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+if img is None:
+    raise SystemExit("OpenCV could not decode smoke image")
+h, w = img.shape[:2]
+print(f"Decoded smoke image: {w}x{h}")
+if w < 300 or h < 150:
+    raise SystemExit("Smoke image is unexpectedly small")
+'@
+
+$ValidateImageScript = Join-Path $BuildRoot "validate_smoke.py"
+Set-Content -Path $ValidateImageScript -Value $ValidateImageCode -Encoding UTF8
+& $Python $ValidateImageScript $WarmupImage
+
 # ---------------------------------------------------------------------------
-# Pre-warm HOMR BEFORE packaging.
+# Run HOMR BEFORE packaging.
 # ---------------------------------------------------------------------------
-# This serves two purposes:
-# 1. Downloads the actual model files into runtime_home.
-# 2. Proves the plain HOMR installation can process a real score before we
-#    spend several minutes building the EXE.
+# This is important: if plain HOMR cannot process a real printed score, the
+# problem is HOMR/dependencies and not PyInstaller. We fail here with a clear
+# log instead of waiting several minutes for packaging.
 $WarmupWork = Join-Path $BuildRoot "homr-warmup"
 New-Item -ItemType Directory -Force -Path $WarmupWork | Out-Null
-$WarmupCopy = Join-Path $WarmupWork "smoke.jpg"
+
+$WarmupCopy = Join-Path $WarmupWork "smoke.png"
 Copy-Item $WarmupImage $WarmupCopy -Force
 
 Push-Location $WarmupWork
 try {
     Write-Host ""
-    Write-Host "Running HOMR pre-packaging smoke inference..." -ForegroundColor Yellow
+    Write-Host "Running plain HOMR on real printed piano score..." -ForegroundColor Yellow
 
     & $Homr $WarmupCopy
     $HomrExit = $LASTEXITCODE
@@ -93,7 +119,7 @@ try {
     Write-Host "Plain HOMR smoke exit code: $HomrExit"
 
     if ($HomrExit -ne 0) {
-        throw "Plain HOMR smoke inference failed before packaging with exit code $HomrExit."
+        throw "Plain HOMR failed on a real printed score before packaging with exit code $HomrExit."
     }
 
     $WarmupXml = Get-ChildItem -Path $WarmupWork -Filter "*.musicxml" -File |
@@ -101,16 +127,22 @@ try {
         Select-Object -First 1
 
     if ($null -eq $WarmupXml) {
-        throw "Plain HOMR smoke inference returned success but produced no MusicXML."
+        throw "Plain HOMR returned success but produced no MusicXML."
+    }
+
+    if ($WarmupXml.Length -lt 100) {
+        throw "Plain HOMR produced an unexpectedly small MusicXML file."
     }
 
     Write-Host "Plain HOMR produced: $($WarmupXml.FullName)" -ForegroundColor Green
+    Write-Host "MusicXML size: $($WarmupXml.Length) bytes"
 }
 finally {
     Pop-Location
 }
 
-# From here on the build must work offline.
+# All model downloads should now be cached. From this point forward, force
+# offline operation so the final EXE test proves self-contained inference.
 $env:HF_HUB_OFFLINE = "1"
 $env:TRANSFORMERS_OFFLINE = "1"
 
@@ -144,12 +176,12 @@ if (!(Test-Path $Exe)) {
 }
 
 # ---------------------------------------------------------------------------
-# Run the ACTUAL packaged EXE and WAIT for it.
+# Test the ACTUAL packaged EXE and WAIT for completion.
 # ---------------------------------------------------------------------------
 $PackagedReport = Join-Path $Dist "packaged-self-test.json"
 
 Write-Host ""
-Write-Host "Running packaged EXE offline self-test using real sheet music..." -ForegroundColor Yellow
+Write-Host "Running packaged EXE offline OMR self-test..." -ForegroundColor Yellow
 
 if (Test-Path $PackagedReport) {
     Remove-Item $PackagedReport -Force
@@ -196,14 +228,14 @@ if (-not $PackagedJson.checks.omr_engine_import) {
 }
 
 if (-not $PackagedJson.checks.omr_offline_inference) {
-    throw "Packaged ScorePlayer.exe could import HOMR but failed real offline OMR inference."
+    throw "Packaged ScorePlayer.exe imported HOMR but failed real offline OMR inference."
 }
 
 Write-Host ""
 Write-Host "Packaged EXE passed real offline OMR inference." -ForegroundColor Green
 
 # ---------------------------------------------------------------------------
-# Release files.
+# Release portable ZIP.
 # ---------------------------------------------------------------------------
 Copy-Item `
     (Join-Path $ProjectRoot "README.md") `
